@@ -41,8 +41,8 @@ from ramp_correction import correct_reset_decay
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
-A     = 2.148e-7
-ALPHA = 2.319
+A     = 1.035e-6   # from combined reset-decay + BFE fit
+ALPHA = 2.783
 BFE_TOL   = 1e-6
 BFE_MAXIT = 30
 
