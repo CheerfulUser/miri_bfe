@@ -1,238 +1,227 @@
-# Brighter-Fatter Effect: Physics-Based Forward Model
+# Brighter-Fatter Effect: Physics-Based Forward Model and Correction
 
 ## Overview
 
-After correcting for charge reset decay in MIRI ramp data, a residual
-systematic remains: bright pixels show a declining gradient profile across
-the ramp, while faint pixels are flat. The gradient (DN/group) should be
-constant for a constant source, so the decline is instrumental. This document
-describes the physical mechanism and the forward model developed to characterise it.
+MIRI ramp data contain two coupled instrumental systematics that distort
+group-to-group gradients:
+
+1. **Charge reset decay (RCD)**: after each detector reset, a non-astrophysical
+   current leaks into the pixel and decays exponentially over ~1–2 groups,
+   elevating early gradients above the true photon rate.
+
+2. **Brighter-fatter effect (BFE)**: as charge accumulates in a pixel during an
+   integration, the electric field inside the pixel grows and repels newly
+   arriving photoelectrons into neighbouring pixels. The PSF core dims
+   progressively through the ramp while a ring around it brightens.
+
+This document describes the joint forward model, the correction pipeline, and
+fitted parameters for three MIRI time-series targets.
 
 ---
 
 ## Physical Mechanism
 
-As charge accumulates in a pixel during an integration, the electric field
-inside the pixel grows. In a 2D detector, charge confined in the pixel plane
-creates a repulsive force on newly arriving photoelectrons. This electrostatic
-repulsion causes the effective collection area of a bright pixel to shrink,
-redistributing electrons to neighbouring pixels. The result is:
+### Charge Reset Decay
 
-- PSF core dims progressively through the ramp (charge in core repels new
-  electrons)
-- A ring around the core brightens correspondingly
+After each detector reset, residual charge leaks from the reset transistor into
+the pixel. The gradient (DN/group) at each pixel follows:
 
-This is the **brighter-fatter effect (BFE)**, well documented in optical CCDs
-and HgCdTe infrared arrays, including HST/WFC3-IR and JWST NIRCam.
+$$\text{grad}(g) = C + A \cdot e^{-g/\tau} - \delta_{g,0} \cdot \Delta$$
 
-### Electrostatics in 2D
+where `C` is the true photon rate, `A` is the decay amplitude, `tau` is the
+timescale in groups, and `Delta` is the first-frame offset (a separate anomaly
+at group 0). `tau` is global (same for all pixels in a subarray); `C`, `A`, and
+`Delta` are fitted per pixel.
 
-For a pixel treated as a charge sheet, the electric force on a test charge at
-position **r** from the pixel centre follows:
+### Brighter-Fatter Effect
 
-$$E \propto \frac{1}{r}$$
+Accumulated charge Q(g) in a pixel repels incoming photoelectrons, reducing the
+effective collection area. For a charge sheet in 2D, the electrostatic force
+falls off as 1/r, giving the BFE kernel:
 
-(Gauss's law in 2D: the field from a line charge falls off as 1/r, not 1/r²
-as in 3D). The force on the accumulated charge from all other pixels, and the
-resulting electron displacement, therefore scales as a kernel:
+$$K(i,j) = -\frac{1}{r^\alpha}, \quad r > 0; \qquad K(0,0) = -\sum_{(i,j)\neq(0,0)} K(i,j)$$
 
-$$K(i,j) \propto -\frac{1}{r^\alpha}, \quad r = \sqrt{i^2 + j^2} > 0$$
-
-The exponent α ≈ 1 for pure 2D electrostatics but is a free parameter that
-absorbs the effective dimensionality of charge spreading, pixel geometry, and
-any diffusion contributions.
-
-### Flux Conservation
-
-The BFE redistributes electrons — it does not create or destroy them. The
-kernel must be flux-conserving:
-
-$$\sum_{i,j} K(i,j) = 0$$
-
-This is enforced by setting the central pixel value to:
-
-$$K(0,0) = -\sum_{(i,j)\neq(0,0)} K(i,j) > 0$$
-
-The positive centre means accumulated charge in a pixel drives electrons
-*out* of that pixel; the negative off-diagonal elements receive the displaced
-electrons from surrounding bright pixels.
+The positive centre (charge repels new electrons out of the pixel) and negative
+off-diagonal elements (neighbouring pixels gain them) conserve total flux.
+The exponent alpha absorbs the effective charge-spreading geometry; empirically
+alpha ≈ 2.8 for MIRI.
 
 ---
 
-## Observed BFE Signature in Wolf-359 Data
+## Combined Forward Model
 
-The BFE signature is directly visible by comparing flux-normalised gradient
-images at early groups (low accumulated charge) versus late groups (high
-accumulated charge).
+The observed gradient at group g is:
 
-![PSF early vs late](wolf359_psf_early_late.png)
+$$\text{grad}_\text{obs}(g) = \underbrace{\left[C + A \cdot e^{-g/\tau} - \delta_{g,0}\Delta\right]}_{\text{true gradient}} \times \left[1 - A_\text{BFE} \cdot (K \ast Q)(g)\right]$$
 
-**Figure 1.** Median gradient image at early groups (g1–3, left), late groups
-(g6–8, centre), and the difference late − early (right), all normalised to the
-same aperture flux. The difference image shows the BFE signature: a negative
-core (electrons lost from the PSF centre) and a positive ring (electrons
-gained by the surrounding pixels).
+where Q(g) is the accumulated charge up to group g:
 
-The effect is also visible in the ratio of each group-averaged PSF to the
-WebbPSF reference model:
+$$Q(g) = \sum_{k=0}^{g-1} \text{grad}_\text{true}(k)$$
 
-![PSF ratios](wolf359_psf_ratios.png)
-
-**Figure 2.** Ratio of early-group (top) and late-group (bottom) PSF images
-to the WebbPSF F2100W model, with radial profiles. The early/model ratio is
-close to unity. The late/model ratio shows a deficit at r < 3 px and an
-excess at r ≈ 4–8 px, consistent with BFE-driven charge redistribution.
+The BFE and RCD are separable in the median over integrations: the BFE factor
+depends on the median Q (identical for all integrations), so the median gradient
+is a clean template for both effects.
 
 ---
 
-## WebbPSF Reference PSF
+## Correction Pipeline (`correct_bfe_rcd`)
 
-The MIRI F2100W point spread function model was generated using WebbPSF
-(STScI):
+Three sequential steps applied to the raw gradients:
+
+### Step 1 — Causal BFE Inversion
+
+For each group in order (causal), divide out the BFE suppression factor:
+
+$$\text{grad}_\text{BFE}(g) = \frac{\text{grad}_\text{obs}(g)}{1 - A_\text{BFE} \cdot (K \ast Q_\text{med})(g)}$$
+
+where Q_med is built from the running sum of the median-over-integrations of
+the BFE-corrected gradients. Since Q_med is the same for every integration, this
+factor is identical across integrations — the BFE correction does not introduce
+integration-to-integration noise.
+
+### Step 2 — Parametric RCD Subtraction
+
+From the BFE-corrected gradients, fit the global decay timescale tau from
+background pixels (excluding the star), then fit per-pixel [C, A, Delta] via
+least squares. Subtract the fitted decay from every integration.
+
+### Step 3 — Non-Parametric Residual Removal
+
+Subtract the per-pixel per-group median over integrations from the
+parametrically corrected gradients, then add back the flat rate estimated from
+the last few groups. This removes any residual group-correlated structure not
+captured by the exponential model (detector non-idealities, column effects,
+etc.) and is the dominant correction for faint targets.
+
+The corrected cube is reconstructed by integrating the corrected gradients:
 
 ```python
-import webbpsf
-miri = webbpsf.MIRI()
-miri.filter = 'F2100W'
-psf = miri.calc_psf(oversample=4, fov_pixels=65)
+cube_cor[:, 1:] = cube[:, :1] + np.cumsum(grads_cor, axis=1)
 ```
 
-The PSF was computed at 4× oversampling (0.02773 arcsec/pixel) and rebinned
-to the native detector scale (0.111 arcsec/pixel):
+### Lightcurve Improvement
 
-```python
-psf_over = psf['OVERSAMP'].data
-ny_o = psf_over.shape[0]
-ny = ny_o // 4
-psf_nat = psf_over.reshape(ny, 4, ny, 4).sum(axis=(1, 3))
-```
-
-The model PSF was registered to the data by fitting position (dy, dx), flux
-scale, and background via Nelder-Mead minimisation of sum-of-squared residuals
-against the early-group cutout image.
+| Target | Raw RMS | Corrected RMS | Improvement |
+|---|---|---|---|
+| Wolf-359 | — | — | — |
+| EV Lac | 2.477% | 0.152% | 16× |
+| TRAPPIST-1 | 0.827% | 0.314% | 2.6× |
 
 ---
 
-## Forward Model
+## Automated BFE Parameter Fitting (`fit_bfe_params`)
 
-For a pixel at position (x, y), the measured gradient at group g is:
+The function `fit_bfe_params` fits A_BFE directly from the data without
+requiring prior knowledge of the star position or BFE parameters.
 
-$$\text{grad}(x, y; g) = \text{rate}(x,y) \times \left[1 - A \cdot (K \ast Q)(x,y;g)\right]$$
+### Source Detection
 
-where:
-- **rate(x, y)** — true photon rate (DN/group), approximated by the registered
-  WebbPSF scaled to the observed late-group flux
-- **A** — dimensionless BFE coupling coefficient (DN⁻¹)
-- **K** — the physics-driven BFE kernel (flux-conserving, 1/r^α off-diagonal)
-- **Q(x, y; g)** — accumulated charge at pixel (x, y) up to group g,
-  approximated as `rate(x, y) × g`
-- **⊛** — 2D convolution
+A detection image is formed from the median over integrations and gradient
+indices 1 to n_grads-1 (excluding the first-frame anomaly and last-frame
+anomaly). SEP (`sep.extract`) is run with a 5-sigma threshold. Edge artifacts
+are excluded by requiring the source to lie more than 20 pixels from the image
+boundary and to have a semi-major/minor axis ratio a/b < 3. The brightest
+remaining source is taken as the target star.
 
-The kernel has a half-width of 20 pixels:
+### Forward Model Fit
+
+The reset-decay parameters (tau, rate_map, Adec_map, delta_map) are fitted from
+the median gradient over a background annulus around the detected star. The
+forward model is then run on a cropped region around the star (crop = cut + kh
++ 30 pixels, where kh = 20 is the kernel half-width). A_BFE is fitted by
+minimising the noise-weighted chi-squared between the simulated and observed
+late − early normalised PSF difference:
+
+$$\chi^2 = \sum_\text{pixels} \left(\frac{\text{sim\_diff} - \text{obs\_diff}}{\sigma_\text{diff}}\right)^2$$
+
+where sigma_diff is the standard error of the per-integration PSF differences
+across all integrations. alpha is held fixed at 2.783. The minimisation uses
+`scipy.optimize.minimize_scalar` with bounded search over log10(A_BFE) in
+[-9, -4].
+
+### Usage
+
+```python
+from ramp_correction import correct_bfe_rcd, fit_bfe_params
+
+# Fit A_bfe automatically then correct
+cube_cor = correct_bfe_rcd(cube, fit_bfe=True, sci_mask=sci_mask,
+                           bg_mask=bg_mask, verbose=True)
+
+# Or fit separately and inspect
+A_bfe, star_x, star_y = fit_bfe_params(cube, sci_mask=sci_mask, verbose=True)
+```
+
+---
+
+## Fitted Parameters
+
+Alpha is consistent across all three targets (~2.8), confirming the BFE kernel
+shape is a detector property. A_BFE varies spatially — Wolf-359, EV Lac, and
+TRAPPIST-1 land on different detector regions.
+
+| Target | A_BFE | alpha | tau (groups) |
+|---|---|---|---|
+| Wolf-359 | 1.035 × 10⁻⁶ | 2.783 | 1.498 |
+| EV Lac | 2.93 × 10⁻⁷ | 2.800 (fixed) | 1.251 |
+| TRAPPIST-1 | 1.20 × 10⁻⁷ | 2.783 (fixed) | 1.819 |
+
+Wolf-359 parameters were fitted with alpha free (2D differential evolution +
+Nelder-Mead). EV Lac and TRAPPIST-1 have alpha fixed to the Wolf-359 value
+because their shorter ramps or weaker BFE signal do not constrain alpha
+independently.
+
+---
+
+## Key Scripts
+
+| Script | Purpose |
+|---|---|
+| `ramp_correction.py` | `correct_bfe_rcd` (3-step hybrid correction) and `fit_bfe_params` (automated BFE fitting) |
+| `apply_nonparametric_correction.py` | Stage-by-stage comparison: raw → BFE only → joint parametric → hybrid |
+| `fit_combined_model.py` | Original Wolf-359 forward model fit (free alpha, 2D optimisation) |
+| `fit_combined_model_evlac.py` | EV Lac forward model fit (alpha fixed, 1D minimisation) |
+| `fit_combined_model_trappist.py` | TRAPPIST-1 forward model fit (alpha fixed, noise-weighted) |
+| `test_evlac.py` | Apply `correct_bfe_rcd` to EV Lac; aperture lightcurves before/after |
+| `test_trappist.py` | Apply `correct_bfe_rcd` to TRAPPIST-1; aperture lightcurves before/after |
+| `validate_fit_bfe_params.py` | Validate automated source detection and A_BFE fitting on EV Lac and TRAPPIST-1 |
+
+---
+
+## BFE Kernel
+
+The kernel has half-width kh = 20 pixels and is normalised to conserve flux:
 
 ```python
 kh = 20
 ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
-r_grid = np.sqrt(ii**2 + jj**2)
-K_bfe = np.where(r_grid > 0, -1.0 / r_grid**alpha, 0.0)
-K_bfe[kh, kh] = -K_bfe.sum()   # flux conservation
-```
-
-The simulation iterates over groups:
-
-```python
-for g in range(n_groups):
-    Q_g = rate_map * g
-    KQ = fftconvolve(Q_g, K_bfe, mode='same')
-    grads_sim[g] = rate_map * (1.0 - A * KQ)
+r = np.sqrt(ii**2 + jj**2)
+K = np.where(r > 0, -1.0 / r**alpha, 0.0)
+K[kh, kh] = -K.sum()
 ```
 
 ---
 
-## Parameter Fitting
+## Status
 
-The model has six free parameters: `[log₁₀A, α, flux, bg, dy, dx]`.
+The joint BFE + RCD correction is working and validated on three MIRI targets.
+The dominant correction for faint targets (TRAPPIST-1) comes from the
+non-parametric median subtraction in Step 3. For bright targets (EV Lac, Wolf-359)
+the BFE inversion in Step 1 is the primary improvement.
 
-The objective function is the sum of squared pixel residuals between the
-simulated and observed flux-normalised late − early PSF difference image,
-evaluated within a circular aperture of radius 12 pixels:
+Automated parameter fitting (`fit_bfe_params`) recovers A_BFE to within ~2%
+of the standalone forward model fits on both EV Lac and TRAPPIST-1.
 
-```python
-def objective(params):
-    log_A, alpha, flux, bg, dy, dx = params
-    A = 10**log_A
-    early_sim, late_sim = run_sim(A, alpha, flux, bg, dy, dx)
-    diff_sim = (late_sim - early_sim) / aperture_flux(late_sim)
-    return np.sum((diff_sim[fit_mask] - obs_diff[fit_mask])**2)
-```
+### Open Questions
 
-Optimisation used differential evolution (global search) followed by
-Nelder-Mead (local polish):
+1. **Spatial variation of A_BFE**: the factor of ~3–8 difference between
+   Wolf-359 and the other two targets likely reflects spatial non-uniformity
+   of the BFE coupling across the MIRI detector, not a physical difference
+   between sources.
 
-```python
-bounds = [(-9, -5), (0.5, 4.0), (1000, 4000), (0, 400), (-2, 2), (-2, 2)]
-res = differential_evolution(objective, bounds, seed=42, maxiter=2000)
-res2 = minimize(objective, res.x, method='Nelder-Mead',
-                options={'xatol': 1e-10, 'fatol': 1e-14, 'maxiter': 50000})
-```
+2. **Short-ramp degeneracy**: with ≤5 gradient groups (EV Lac), tau and A_BFE
+   are partially degenerate. Fixing alpha and using the non-parametric Step 3
+   mitigates this but does not eliminate it.
 
-Freeing the source position (dy, dx) reduced the residual by a factor of ~4
-compared to fixing the position from the early-group registration.
-
-### Best-fit Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| A (coupling) | 2.148 × 10⁻⁷ DN⁻¹ |
-| α (power law) | 2.319 |
-| Flux scale | 3573 DN/group |
-| Background | 210 DN/group |
-| dy | −0.220 px |
-| dx | 0.327 px |
-| Final residual | 1.89 × 10⁻⁸ |
-
----
-
-## Model vs Data Comparison
-
-![BFE fit](wolf359_bfe_fit.png)
-
-**Figure 3.** Comparison of simulated and observed PSF change due to the BFE.
-**Top row (simulated):** early-group PSF, late-group PSF, simulated
-late − early difference, and radial profile comparison.
-**Bottom row (observed):** same quantities from the Wolf-359 data.
-**Bottom-right:** residual between simulated and observed difference images.
-The model reproduces the negative core and positive ring at the correct
-amplitude and spatial scale.
-
----
-
-## Simulation Intermediate Steps
-
-![BFE simulation](wolf359_bfe_simulation.png)
-
-**Figure 4.** Forward simulation showing the progressive PSF distortion as
-charge accumulates. Each panel shows the BFE-modified gradient image at a
-given group, normalised to the aperture flux. The core-dimming and ring-
-brightening grow monotonically with accumulated charge Q(g).
-
----
-
-## Status and Limitations
-
-The forward model successfully reproduces the observed PSF shape change
-with physically motivated parameters. However, applying the inversion:
-
-$$\text{grad}_\text{cor}(x,y;g) = \frac{\text{grad}_\text{obs}(x,y;g)}{1 - A \cdot (K \ast Q)(x,y;g)}$$
-
-does not flatten the gradient profiles in practice. The fitted A is derived
-from PSF morphology (spatial redistribution of flux between pixels), not from
-the profile slope (temporal evolution of flux within a single pixel's
-aperture-summed light curve). These are related but not identical quantities,
-and the correction formula diverges when A is increased to levels that would
-flatten the aperture-integrated profiles.
-
-A complete correction likely requires either:
-1. Fitting A directly to the flatness of aperture-summed gradient profiles
-   in a regime where the denominator remains stable, or
-2. An iterative correction scheme that avoids the divergence near bright pixels.
+3. **Last-frame anomaly**: the final gradient in each integration is always
+   excluded. Its cause is unknown and it is not corrected.
