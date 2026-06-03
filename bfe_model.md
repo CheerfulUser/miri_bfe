@@ -29,38 +29,34 @@ the pixel. The gradient (DN/group) at each pixel follows:
 $$\text{grad}(g) = C + A \cdot e^{-g/\tau} - \delta_{g,0} \cdot \Delta$$
 
 where `C` is the true photon rate, `A` is the decay amplitude, `tau` is the
-timescale in groups, and `Delta` is the first-frame offset (a separate anomaly
-at group 0). `tau` is global (same for all pixels in a subarray); `C`, `A`, and
-`Delta` are fitted per pixel.
+timescale in groups, and `Delta` is the first-frame offset. `tau` is global;
+`C`, `A`, and `Delta` are fitted per pixel.
 
 ### Brighter-Fatter Effect
 
-Accumulated charge Q(g) in a pixel repels incoming photoelectrons, reducing the
-effective collection area. For a charge sheet in 2D, the electrostatic force
-falls off as 1/r, giving the BFE kernel:
+Accumulated charge Q(g) in a pixel repels incoming photoelectrons. The BFE
+kernel is radially symmetric:
 
 $$K(i,j) = -\frac{1}{r^\alpha}, \quad r > 0; \qquad K(0,0) = -\sum_{(i,j)\neq(0,0)} K(i,j)$$
 
-The positive centre (charge repels new electrons out of the pixel) and negative
-off-diagonal elements (neighbouring pixels gain them) conserve total flux.
-The exponent alpha absorbs the effective charge-spreading geometry; empirically
-alpha ≈ 2.8 for MIRI.
+The kernel sums to zero by construction (`ΣK = 0`), which is the flux-conservation
+constraint. The exponent alpha ≈ 2.8 for MIRI (SNR-weighted average of Wolf-359
+and EV Lac fits).
 
 ---
 
 ## Combined Forward Model
 
-The observed gradient at group g is:
+The observed gradient at group g is modelled as:
 
-$$\text{grad}_\text{obs}(g) = \underbrace{\left[C + A \cdot e^{-g/\tau} - \delta_{g,0}\Delta\right]}_{\text{true gradient}} \times \left[1 - A_\text{BFE} \cdot (K \ast Q)(g)\right]$$
+$$\text{grad}_\text{obs}(x,y;g) = \text{true\_grad}(x,y;g) - A_\text{BFE} \cdot \bigl(K \ast (Q \cdot \text{true\_grad})\bigr)(x,y;g)$$
 
-where Q(g) is the accumulated charge up to group g:
+where Q(g) is the accumulated charge up to group g. This formulation conserves
+total image flux exactly: since `ΣK = 0`, summing over all pixels gives
+`Σ(K⊛(Q·true_grad)) = 0`.
 
-$$Q(g) = \sum_{k=0}^{g-1} \text{grad}_\text{true}(k)$$
-
-The BFE and RCD are separable in the median over integrations: the BFE factor
-depends on the median Q (identical for all integrations), so the median gradient
-is a clean template for both effects.
+The BFE and RCD effects are separable in the median over integrations (Q_med is
+the same for all integrations), so the median gradient is a clean template for both.
 
 ---
 
@@ -68,32 +64,37 @@ is a clean template for both effects.
 
 Three sequential steps applied to the raw gradients:
 
-### Step 1 — Causal BFE Inversion
+### Step 1 — Causal Iterative BFE Correction
 
-For each group in order (causal), divide out the BFE suppression factor:
+For each group g in causal order, solve iteratively for `true_grad` using the
+Born series:
 
-$$\text{grad}_\text{BFE}(g) = \frac{\text{grad}_\text{obs}(g)}{1 - A_\text{BFE} \cdot (K \ast Q_\text{med})(g)}$$
+$$\text{true\_grad}^{(n+1)} = \text{grad}_\text{obs} + A_\text{BFE} \cdot K \ast (Q_\text{med} \cdot \text{true\_grad}^{(n)})$$
 
-where Q_med is built from the running sum of the median-over-integrations of
-the BFE-corrected gradients. Since Q_med is the same for every integration, this
-factor is identical across integrations — the BFE correction does not introduce
-integration-to-integration noise.
+Starting from `true_grad^(0) = grad_obs`, 3 iterations are used. The corrected
+gradient for each integration is:
+
+```python
+grads_bfe[:, g] = grads_raw[:, g] + A_bfe * fftconvolve(Q_med * true_grad_est, K)
+```
+
+This is flux-conserving: `Σ(K⊛(Q·true_grad)) = 0` because K sums to zero.
+The correction has negligible impact on background pixels (<0.05% per group for
+Wolf-359 at r > 20 px).
 
 ### Step 2 — Parametric RCD Subtraction
 
-From the BFE-corrected gradients, fit the global decay timescale tau from
-background pixels (excluding the star), then fit per-pixel [C, A, Delta] via
-least squares. Subtract the fitted decay from every integration.
+Fit the global decay timescale tau from background pixels, then fit per-pixel
+[C, A, Delta] via least squares. Subtract the fitted decay from every integration.
 
 ### Step 3 — Non-Parametric Residual Removal
 
-Subtract the per-pixel per-group median over integrations from the
-parametrically corrected gradients, then add back the flat rate estimated from
-the last few groups. This removes any residual group-correlated structure not
-captured by the exponential model (detector non-idealities, column effects,
-etc.) and is the dominant correction for faint targets.
+Subtract the per-pixel per-group median over integrations, then add back the
+flat rate from the last few groups. This removes residual group-correlated
+structure not captured by the exponential model and is the dominant correction
+for faint targets.
 
-The corrected cube is reconstructed by integrating the corrected gradients:
+The corrected cube is reconstructed from corrected gradients:
 
 ```python
 cube_cor[:, 1:] = cube[:, :1] + np.cumsum(grads_cor, axis=1)
@@ -103,73 +104,86 @@ cube_cor[:, 1:] = cube[:, :1] + np.cumsum(grads_cor, axis=1)
 
 | Target | Raw RMS | Corrected RMS | Improvement |
 |---|---|---|---|
-| Wolf-359 | — | — | — |
-| EV Lac | 2.477% | 0.152% | 16× |
+| EV Lac | 2.477% | 0.150% | 16× |
 | TRAPPIST-1 | 0.827% | 0.314% | 2.6× |
 
 ---
 
 ## Automated BFE Parameter Fitting (`fit_bfe_params`)
 
-The function `fit_bfe_params` fits A_BFE directly from the data without
-requiring prior knowledge of the star position or BFE parameters.
-
 ### Source Detection
 
-A detection image is formed from the median over integrations and gradient
-indices 1 to n_grads-1 (excluding the first-frame anomaly and last-frame
-anomaly). SEP (`sep.extract`) is run with a 5-sigma threshold. Edge artifacts
-are excluded by requiring the source to lie more than 20 pixels from the image
-boundary and to have a semi-major/minor axis ratio a/b < 3. The brightest
-remaining source is taken as the target star.
+The detection image is the median over integrations and gradient indices
+1 to n_grads-1. SEP (`sep.extract`) is run at 5σ. Sources are filtered to:
+- More than 20 pixels from the image boundary
+- Semi-major/minor axis ratio a/b < 3 (excludes elongated edge artifacts)
+- Isophotal flux ≥ 50,000 DN (minimum for reliable BFE fitting)
+
+If no source meets the brightness threshold, the BFE correction is skipped
+(`A_bfe = 0`).
 
 ### Forward Model Fit
 
-The reset-decay parameters (tau, rate_map, Adec_map, delta_map) are fitted from
-the median gradient over a background annulus around the detected star. The
-forward model is then run on a cropped region around the star (crop = cut + kh
-+ 30 pixels, where kh = 20 is the kernel half-width). A_BFE is fitted by
-minimising the noise-weighted chi-squared between the simulated and observed
-late − early normalised PSF difference:
+RCD parameters (tau, rate_map, Adec_map) are fitted from a background annulus.
+The forward model runs on a cropped region (crop = cut + kh + 30 px). A_BFE
+is fitted by minimising the noise-weighted chi-squared between simulated and
+observed late−early normalised PSF difference:
 
 $$\chi^2 = \sum_\text{pixels} \left(\frac{\text{sim\_diff} - \text{obs\_diff}}{\sigma_\text{diff}}\right)^2$$
 
-where sigma_diff is the standard error of the per-integration PSF differences
-across all integrations. alpha is held fixed at 2.783. The minimisation uses
-`scipy.optimize.minimize_scalar` with bounded search over log10(A_BFE) in
-[-9, -4].
+The fitting radius `fit_r` is determined automatically from the SNR profile of
+the observed PSF difference — the outermost radius where SNR > 2, with a
+minimum of 5 pixels.
+
+By default alpha is fixed at 2.797. Passing `alpha_bfe=None` fits both A_BFE
+and alpha simultaneously using Powell minimisation.
 
 ### Usage
 
 ```python
 from ramp_correction import correct_bfe_rcd, fit_bfe_params
 
-# Fit A_bfe automatically then correct
-cube_cor = correct_bfe_rcd(cube, fit_bfe=True, sci_mask=sci_mask,
-                           bg_mask=bg_mask, verbose=True)
+# Auto-fit A_bfe (alpha fixed at 2.797), then correct
+cube_cor = correct_bfe_rcd(cube, fit_bfe=True, sci_mask=sci_mask, verbose=True)
 
-# Or fit separately and inspect
-A_bfe, star_x, star_y = fit_bfe_params(cube, sci_mask=sci_mask, verbose=True)
+# Fit only A_bfe (alpha fixed)
+A_bfe, sx, sy = fit_bfe_params(cube, sci_mask=sci_mask, verbose=True)
+
+# Fit both A_bfe and alpha
+A_bfe, alpha, sx, sy = fit_bfe_params(cube, alpha_bfe=None, sci_mask=sci_mask, verbose=True)
 ```
 
 ---
 
 ## Fitted Parameters
 
-Alpha is consistent across all three targets (~2.8), confirming the BFE kernel
-shape is a detector property. A_BFE varies spatially — Wolf-359, EV Lac, and
-TRAPPIST-1 land on different detector regions.
+Alpha is consistent across Wolf-359 and EV Lac (~2.78–2.83), confirming the
+kernel shape is a detector property. The default alpha (2.797) is a SNR-weighted
+average of the two fits. A_BFE varies by detector position.
 
-| Target | A_BFE | alpha | tau (groups) |
-|---|---|---|---|
-| Wolf-359 | 1.035 × 10⁻⁶ | 2.783 | 1.498 |
-| EV Lac | 2.93 × 10⁻⁷ | 2.800 (fixed) | 1.251 |
-| TRAPPIST-1 | 1.20 × 10⁻⁷ | 2.783 (fixed) | 1.819 |
+| Target | A_BFE | alpha | tau (groups) | Method |
+|---|---|---|---|---|
+| Wolf-359 | 1.035 × 10⁻⁶ | 2.783 | 1.498 | Free alpha, Powell |
+| EV Lac | 3.11 × 10⁻⁷ | 2.826 | 1.251 | Free alpha, Powell |
+| TRAPPIST-1 | 3.72 × 10⁻⁷ | 2.797 (fixed) | 1.819 | Alpha fixed, FIT_R=5 |
 
-Wolf-359 parameters were fitted with alpha free (2D differential evolution +
-Nelder-Mead). EV Lac and TRAPPIST-1 have alpha fixed to the Wolf-359 value
-because their shorter ramps or weaker BFE signal do not constrain alpha
-independently.
+TRAPPIST-1 alpha is fixed because its weaker BFE signal cannot constrain the
+kernel shape independently. Its A_BFE is better constrained by fitting only the
+inner 5 pixels (FIT_R=5) where the SNR is highest.
+
+---
+
+## Transient Injection Test
+
+A synthetic transient (bright spike + exponential decay, peak 5000 DN/group ≈
+8% of TRAPPIST-1 stellar flux, τ = 5 integrations) was injected at the star
+position using the MIRI F1500W PSF from WebbPSF. The BFE+RCD correction was
+applied to both the original and injected cubes.
+
+**Result**: correction impact on the transient peak = **0.011%** — negligible.
+The transient contributes charge only within the integration where it occurs,
+so it does not substantially change the accumulated Q that drives the BFE
+correction.
 
 ---
 
@@ -177,51 +191,50 @@ independently.
 
 | Script | Purpose |
 |---|---|
-| `ramp_correction.py` | `correct_bfe_rcd` (3-step hybrid correction) and `fit_bfe_params` (automated BFE fitting) |
+| `ramp_correction.py` | `correct_bfe_rcd` (3-step hybrid correction) and `fit_bfe_params` (automated BFE fitting with SNR-based fit radius and brightness threshold) |
 | `apply_nonparametric_correction.py` | Stage-by-stage comparison: raw → BFE only → joint parametric → hybrid |
-| `fit_combined_model.py` | Original Wolf-359 forward model fit (free alpha, 2D optimisation) |
-| `fit_combined_model_evlac.py` | EV Lac forward model fit (alpha fixed, 1D minimisation) |
-| `fit_combined_model_trappist.py` | TRAPPIST-1 forward model fit (alpha fixed, noise-weighted) |
+| `fit_combined_model.py` | Wolf-359 forward model fit (free alpha, Powell) |
+| `fit_combined_model_evlac.py` | EV Lac forward model fit (free alpha, Powell, noise-weighted) |
+| `fit_combined_model_trappist.py` | TRAPPIST-1 forward model fit (alpha fixed, FIT_R=5) |
 | `test_evlac.py` | Apply `correct_bfe_rcd` to EV Lac; aperture lightcurves before/after |
-| `test_trappist.py` | Apply `correct_bfe_rcd` to TRAPPIST-1; aperture lightcurves before/after |
-| `validate_fit_bfe_params.py` | Validate automated source detection and A_BFE fitting on EV Lac and TRAPPIST-1 |
+| `test_trappist.py` | Apply `correct_bfe_rcd` to TRAPPIST-1 with jurassic mask |
+| `validate_fit_bfe_params.py` | Validate automated source detection and A_BFE fitting |
+| `inject_transient.py` | Transient injection-recovery test using MIRI F1500W PSF |
 
 ---
 
 ## BFE Kernel
 
-The kernel has half-width kh = 20 pixels and is normalised to conserve flux:
+The kernel spans 41×41 pixels (kh=20), is radially symmetric, and sums to zero:
 
 ```python
 kh = 20
 ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
 r = np.sqrt(ii**2 + jj**2)
 K = np.where(r > 0, -1.0 / r**alpha, 0.0)
-K[kh, kh] = -K.sum()
+K[kh, kh] = -K.sum()   # enforces ΣK = 0
 ```
+
+The off-diagonal values fall as 1/r^2.8 — by r=10 px they are ~10× smaller
+than at r=1, and by r=20 px ~700× smaller.
 
 ---
 
 ## Status
 
-The joint BFE + RCD correction is working and validated on three MIRI targets.
-The dominant correction for faint targets (TRAPPIST-1) comes from the
-non-parametric median subtraction in Step 3. For bright targets (EV Lac, Wolf-359)
-the BFE inversion in Step 1 is the primary improvement.
-
-Automated parameter fitting (`fit_bfe_params`) recovers A_BFE to within ~2%
-of the standalone forward model fits on both EV Lac and TRAPPIST-1.
+The joint BFE+RCD correction is validated on three MIRI targets with a
+flux-conserving iterative BFE inversion (Step 1). The correction has negligible
+impact on background pixels (<0.05%) and on injected transients (<0.02%).
 
 ### Open Questions
 
-1. **Spatial variation of A_BFE**: the factor of ~3–8 difference between
-   Wolf-359 and the other two targets likely reflects spatial non-uniformity
-   of the BFE coupling across the MIRI detector, not a physical difference
-   between sources.
+1. **Spatial variation of A_BFE**: the factor of ~3 difference between Wolf-359
+   and EV Lac/TRAPPIST-1 likely reflects spatial non-uniformity of the BFE
+   coupling across the MIRI detector.
 
-2. **Short-ramp degeneracy**: with ≤5 gradient groups (EV Lac), tau and A_BFE
-   are partially degenerate. Fixing alpha and using the non-parametric Step 3
-   mitigates this but does not eliminate it.
+2. **Kernel symmetry**: the current kernel is radially symmetric. Real MIRI BFE
+   may have preferred directions (readout, crystal axes) that a purely radial
+   kernel cannot capture.
 
-3. **Last-frame anomaly**: the final gradient in each integration is always
-   excluded. Its cause is unknown and it is not corrected.
+3. **Last-frame anomaly**: the final gradient in each integration is excluded.
+   Its cause is unknown.
