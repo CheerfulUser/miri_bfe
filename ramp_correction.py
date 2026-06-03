@@ -342,6 +342,10 @@ def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
         round_sources = objects[interior]
     if len(round_sources) == 0:
         round_sources = objects
+    if len(round_sources) == 0 or round_sources[np.argsort(round_sources['flux'])[-1]]['flux'] < 50000:
+        if verbose:
+            print('  No source meets brightness threshold — skipping BFE fit')
+        return None, nx // 2, ny // 2
     round_sources = round_sources[np.argsort(round_sources['flux'])[::-1]]
     star = round_sources[0]
     sy, sx = int(round(star['y'])), int(round(star['x']))
@@ -566,9 +570,15 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
             bg_mask=bg_mask, sci_mask=sci_mask,
             bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
             ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
-        A_bfe, _sx, _sy = fit_result
-        if verbose:
-            print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
+        A_bfe_fit, _sx, _sy = fit_result
+        if A_bfe_fit is None:
+            if verbose:
+                print('No source meets brightness threshold — skipping BFE correction')
+            A_bfe = 0.0
+        else:
+            A_bfe = A_bfe_fit
+            if verbose:
+                print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
 
     # Step 1: causal iterative BFE correction — flux conserving
     # Forward model: grad_obs = true_grad - A * K ⊛ (Q * true_grad)
