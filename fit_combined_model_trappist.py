@@ -34,7 +34,7 @@ CUT = 20       # half-side of PSF cutout
 AP_RADIUS = 5
 EARLY = [2, 3, 4]
 LATE = [9, 10, 11]
-FIT_R = 10
+FIT_R = 5
 N_GROUPS = 14
 
 # Wolf-359 fitted parameters for comparison

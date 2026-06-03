@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from astropy.io import fits
 from scipy.signal import fftconvolve
-from scipy.optimize import minimize_scalar, curve_fit
+from scipy.optimize import minimize, curve_fit
 
 DATA = Path('/Users/rri38/Documents/work/code/jwst/ramps/evlac/MAST_2026-05-21T23_53_57.816Z/JWST/jw06122010001_02101_00001_mirimage_uncal.fits')
 OUT = Path(__file__).parent
@@ -120,20 +120,19 @@ def simulate(A_bfe, alpha):
         Q += true_grad
     return grads_s
 
-ALPHA_FIXED = 2.8
-
-def objective(log_A_arr):
-    grads_s = simulate(10**log_A_arr[0], ALPHA_FIXED)
+def objective(p):
+    log_A, alpha = p
+    grads_s = simulate(10**log_A, alpha)
     sim_diff = cutout_psf(grads_s, LATE) - cutout_psf(grads_s, EARLY)
     return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
 
 # ---------------------------------------------------------------------------
 # Optimise
 # ---------------------------------------------------------------------------
-print('Running bounded scalar minimisation (alpha fixed)...')
-res_scalar = minimize_scalar(lambda la: objective([la]), bounds=(-9, -4), method='bounded')
-log_A_fit = res_scalar.x
-alpha_fit = ALPHA_FIXED
+print('Running Powell minimisation (log_A and alpha free)...')
+result = minimize(objective, x0=[-6.5, 2.8], method='Powell',
+                  options={'xtol': 1e-8, 'ftol': 1e-12, 'maxiter': 50000})
+log_A_fit, alpha_fit = result.x
 A_bfe_fit = 10**log_A_fit
 print(f'Final: A={A_bfe_fit:.4e}, alpha={alpha_fit:.4f}')
 

@@ -271,9 +271,9 @@ def correct_reset_decay(cube, method='median', mask=None, mask_dilation=0,
     return cube_cor
 
 
-def fit_bfe_params(cube, alpha_bfe=2.783, bg_mask=None, sci_mask=None,
+def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
                    bfe_early_groups=None, bfe_late_groups=None,
-                   ap_radius=5, cut=20, fit_r=10, verbose=False):
+                   ap_radius=5, cut=20, fit_r=None, verbose=False):
     """
     Find the brightest source in the image and fit A_bfe via the forward model.
 
@@ -420,40 +420,74 @@ def fit_bfe_params(cube, alpha_bfe=2.783, bg_mask=None, sci_mask=None,
     noise_diff = np.clip(noise_diff, noise_diff[noise_diff > 0].min() * 0.1, None)
 
     yy_c, xx_c = np.mgrid[:2*cut+1, :2*cut+1]
-    fit_mask = np.sqrt((yy_c - cut)**2 + (xx_c - cut)**2) <= fit_r
+    r_map_c = np.sqrt((yy_c - cut)**2 + (xx_c - cut)**2)
+
+    if fit_r is None:
+        snr_profile = np.array([
+            np.mean(np.abs(obs_diff[np.round(r_map_c).astype(int) == ri])) /
+            np.mean(noise_diff[np.round(r_map_c).astype(int) == ri])
+            for ri in range(1, cut)
+        ])
+        above = np.where(snr_profile > 2.0)[0]
+        fit_r = max(5, int(above[-1]) + 1) if len(above) > 0 else 5
+        if verbose:
+            print(f'  Auto fit_r = {fit_r} px (SNR-based)')
+
+    fit_mask = r_map_c <= fit_r
 
     ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
     r = np.sqrt(ii**2 + jj**2)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        K = np.where(r > 0, -1.0 / r**alpha_bfe, 0.0)
-    K[kh, kh] = -K.sum()
 
-    def _simulate(A_bfe_val):
+    def _make_kernel(al):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            Kk = np.where(r > 0, -1.0 / r**al, 0.0)
+        Kk[kh, kh] = -Kk.sum()
+        return Kk
+
+    def _simulate(A_bfe_val, al=alpha_bfe):
+        Kk = _make_kernel(al)
         Q = np.zeros((nyc, nxc))
         grads_s = np.zeros((n_grads, nyc, nxc))
         for g in range(n_grads):
             tg = rate_c + Adec_c * np.exp(-g / tau)
             if g == 0:
                 tg = tg - delta_c
-            KQ = fftconvolve(Q, K, mode='same')
+            KQ = fftconvolve(Q, Kk, mode='same')
             grads_s[g] = tg * (1.0 - A_bfe_val * KQ)
             Q += tg
         return grads_s
 
-    def _objective(log_A):
-        grads_s = _simulate(10**log_A)
-        sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
-        return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
+    if alpha_bfe is None:
+        from scipy.optimize import minimize as _minimize
+        alpha0 = 2.797
 
-    result = minimize_scalar(_objective, bounds=(-9, -4), method='bounded')
-    A_bfe_fit = 10**result.x
-    if verbose:
-        print(f'  A_bfe = {A_bfe_fit:.4e}  (alpha fixed at {alpha_bfe})')
+        def _objective_2d(p):
+            log_A, al = p
+            grads_s = _simulate(10**log_A, al)
+            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
+            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
 
-    return A_bfe_fit, sx, sy
+        res = _minimize(_objective_2d, x0=[np.log10(1e-6), alpha0], method='Powell',
+                        options={'xtol': 1e-8, 'ftol': 1e-12, 'maxiter': 50000})
+        log_A_fit, alpha_fit = res.x
+        A_bfe_fit = 10**log_A_fit
+        if verbose:
+            print(f'  A_bfe = {A_bfe_fit:.4e}  alpha = {alpha_fit:.4f}  (both fitted)')
+        return A_bfe_fit, alpha_fit, sx, sy
+    else:
+        def _objective(log_A):
+            grads_s = _simulate(10**log_A)
+            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
+            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
+
+        result = minimize_scalar(_objective, bounds=(-9, -4), method='bounded')
+        A_bfe_fit = 10**result.x
+        if verbose:
+            print(f'  A_bfe = {A_bfe_fit:.4e}  (alpha fixed at {alpha_bfe})')
+        return A_bfe_fit, sx, sy
 
 
-def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
+def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.797,
                     bg_mask=None, late_groups=None, verbose=False,
                     fit_bfe=False, sci_mask=None,
                     bfe_early_groups=None, bfe_late_groups=None,
@@ -527,14 +561,20 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
     if fit_bfe:
         if verbose:
             print('Fitting A_bfe from brightest source...')
-        A_bfe, _sx, _sy = fit_bfe_params(
-            cube, alpha_bfe=alpha_bfe, bg_mask=bg_mask, sci_mask=sci_mask,
+        fit_result = fit_bfe_params(
+            cube, alpha_bfe=alpha_bfe,
+            bg_mask=bg_mask, sci_mask=sci_mask,
             bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
             ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
+        A_bfe, _sx, _sy = fit_result
         if verbose:
             print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
 
-    # Step 1: causal BFE inversion over all gradients
+    # Step 1: causal iterative BFE correction — flux conserving
+    # Forward model: grad_obs = true_grad - A * K ⊛ (Q * true_grad)
+    # Iterative inversion: true_grad^(n+1) = grad_obs + A * K ⊛ (Q * true_grad^(n))
+    # Since K sums to zero, K̂(0)=0 → total image flux is exactly conserved.
+    N_ITER = 3
     kh = 20
     ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
     r = np.sqrt(ii**2 + jj**2)
@@ -547,9 +587,12 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
     for g in range(n_grads_all):
         if g > 0:
             Q_med = Q_med + np.median(grads_bfe[:, g-1], axis=0)
-        KQ = fftconvolve(Q_med, K, mode='same')
-        factor = np.where(1.0 - A_bfe * KQ > 0.05, 1.0 - A_bfe * KQ, 1.0)
-        grads_bfe[:, g] = grads_raw[:, g] / factor[None]
+        med_obs_g = np.median(grads_raw[:, g], axis=0)
+        true_grad_est = med_obs_g.copy()
+        for _ in range(N_ITER):
+            true_grad_est = med_obs_g + A_bfe * fftconvolve(Q_med * true_grad_est, K, mode='same')
+        KQg = fftconvolve(Q_med * true_grad_est, K, mode='same')
+        grads_bfe[:, g] = grads_raw[:, g] + A_bfe * KQg[None]
         if verbose:
             print(f'  BFE g={g}', end='\r')
     if verbose:
