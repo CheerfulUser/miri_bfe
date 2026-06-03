@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 from scipy.interpolate import griddata
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize_scalar
 
 
 def build_correction_map(cube, mask=None):
@@ -271,8 +271,193 @@ def correct_reset_decay(cube, method='median', mask=None, mask_dilation=0,
     return cube_cor
 
 
+def fit_bfe_params(cube, alpha_bfe=2.783, bg_mask=None, sci_mask=None,
+                   bfe_early_groups=None, bfe_late_groups=None,
+                   ap_radius=5, cut=20, fit_r=10, verbose=False):
+    """
+    Find the brightest source in the image and fit A_bfe via the forward model.
+
+    Uses SEP to locate the source, fits the reset-decay parameters (tau,
+    rate_map, Adec_map) from the median gradient, then fits A_bfe by
+    minimising the residual between the modelled and observed late−early
+    normalised PSF difference. alpha_bfe is held fixed.
+
+    The forward model runs on a cropped region around the star to keep
+    the fftconvolve tractable on large detectors.
+
+    Parameters
+    ----------
+    cube : ndarray (n_int, n_groups, ny, nx), float
+        Raw ramp cube.
+    alpha_bfe : float
+        BFE kernel power-law index (fixed during fit, default 2.783).
+    bg_mask : ndarray (ny, nx) bool, optional
+        True = background pixels for tau fitting. If None an annulus around
+        the detected source is used.
+    sci_mask : ndarray (ny, nx) bool, optional
+        True = good science pixels. Passed to SEP to exclude bad pixels.
+    bfe_early_groups : list of int, optional
+        Gradient indices defining early groups for the PSF difference.
+        Default: groups 1 to min(3, n_grads//4).
+    bfe_late_groups : list of int, optional
+        Gradient indices defining late groups for the PSF difference.
+        Default: last three valid gradients.
+    ap_radius : float
+        Aperture radius in pixels for PSF normalisation.
+    cut : int
+        Half-size of the PSF cutout in pixels.
+    fit_r : float
+        Radius in pixels within the cutout used for chi-squared fitting.
+    verbose : bool
+
+    Returns
+    -------
+    A_bfe : float
+        Fitted BFE amplitude.
+    sx, sy : int
+        Detected star position (x, y).
+    """
+    import sep
+    from scipy.signal import fftconvolve
+
+    cube = np.asarray(cube, dtype=float)
+    n_int, n_groups, ny, nx = cube.shape
+    n_grads = n_groups - 2
+    g_arr = np.arange(n_grads, dtype=float)
+
+    grads = np.diff(cube, axis=1)[:, :n_grads]
+    med_grad = np.median(grads, axis=0)
+
+    # Detect brightest round source (excludes elongated edge artifacts)
+    detect_img = np.median(grads[:, 1:n_grads], axis=(0, 1)).astype(np.float64)
+    sep_mask = (~sci_mask.astype(bool)) if sci_mask is not None else None
+    bkg = sep.Background(detect_img, mask=sep_mask)
+    img_sub = (detect_img - bkg.back()).astype(np.float64)
+    objects = sep.extract(img_sub, thresh=5.0, err=bkg.globalrms, mask=sep_mask)
+    edge = 20
+    interior = ((objects['x'] > edge) & (objects['x'] < nx - edge) &
+                (objects['y'] > edge) & (objects['y'] < ny - edge))
+    round_sources = objects[interior & (objects['a'] / objects['b'] < 3)]
+    if len(round_sources) == 0:
+        round_sources = objects[interior]
+    if len(round_sources) == 0:
+        round_sources = objects
+    round_sources = round_sources[np.argsort(round_sources['flux'])[::-1]]
+    star = round_sources[0]
+    sy, sx = int(round(star['y'])), int(round(star['x']))
+    if verbose:
+        print(f'  Brightest source at x={sx}, y={sy}  flux={star["flux"]:.0f}')
+
+    # Background mask for tau fitting
+    yy_full, xx_full = np.mgrid[:ny, :nx]
+    r_star = np.sqrt((yy_full - sy)**2 + (xx_full - sx)**2)
+    if bg_mask is not None:
+        _bg = bg_mask.astype(bool)
+    else:
+        _bg = (r_star > 15) & (r_star < min(ny, nx) // 3)
+        if sci_mask is not None:
+            _bg &= sci_mask.astype(bool)
+
+    mean_bg = np.nanmean(med_grad[1:, _bg], axis=1)
+    def _exp1(g, C, A, t): return C + A * np.exp(-g / t)
+    popt, _ = curve_fit(_exp1, g_arr[1:], mean_bg,
+                        p0=[mean_bg[-1], mean_bg[0] - mean_bg[-1], 1.5])
+    tau = float(popt[2])
+    if verbose:
+        print(f'  tau = {tau:.4f} groups')
+
+    exp_g = np.exp(-g_arr / tau)
+    ff_col = np.zeros(n_grads); ff_col[0] = -1.0
+    X = np.column_stack([np.ones(n_grads), exp_g, ff_col])
+    params, _, _, _ = np.linalg.lstsq(X, med_grad.reshape(n_grads, -1), rcond=None)
+    rate_map = params[0].reshape(ny, nx)
+    Adec_map = params[1].reshape(ny, nx)
+    delta_map = params[2].reshape(ny, nx)
+
+    # Crop to a region around the star for the forward model
+    kh = 20
+    crop = cut + kh + 30
+    y0, y1 = max(0, sy - crop), min(ny, sy + crop + 1)
+    x0, x1 = max(0, sx - crop), min(nx, sx + crop + 1)
+    rate_c = rate_map[y0:y1, x0:x1]
+    Adec_c = Adec_map[y0:y1, x0:x1]
+    delta_c = delta_map[y0:y1, x0:x1]
+    grads_c = grads[:, :, y0:y1, x0:x1]
+    cy, cx = sy - y0, sx - x0   # star position in cropped frame
+    nyc, nxc = rate_c.shape
+
+    # Group selections: skip group 1 (still affected by first-frame residuals)
+    # use 2-3 groups from the early/late thirds of the valid ramp
+    if bfe_early_groups is None:
+        n_e = max(2, min(3, n_grads // 4))
+        start = 1 if n_grads < 8 else 2
+        bfe_early_groups = list(range(start, start + n_e))
+    if bfe_late_groups is None:
+        n_e = max(2, min(3, n_grads // 4))
+        bfe_late_groups = list(range(n_grads - n_e, n_grads))
+
+    _ap_yy, _ap_xx = np.mgrid[:2*cut+1, :2*cut+1]
+    _ap_mask = np.sqrt((_ap_yy - cut)**2 + (_ap_xx - cut)**2) <= ap_radius
+
+    def _cutout(arr_3d, glist):
+        stack = np.median(arr_3d[np.array(glist)], axis=0)
+        c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
+        return c / c[_ap_mask].sum()
+
+    def _cutout_perint(arr_4d, glist):
+        gl = np.array(glist)
+        cuts = []
+        for i in range(arr_4d.shape[0]):
+            stack = np.median(arr_4d[i, gl], axis=0)
+            c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
+            cuts.append(c / c[_ap_mask].sum())
+        return np.array(cuts)
+
+    diff_perint = (_cutout_perint(grads_c, bfe_late_groups)
+                   - _cutout_perint(grads_c, bfe_early_groups))
+    obs_diff = np.median(diff_perint, axis=0)
+    noise_diff = np.std(diff_perint, axis=0) / np.sqrt(n_int)
+    noise_diff = np.clip(noise_diff, noise_diff[noise_diff > 0].min() * 0.1, None)
+
+    yy_c, xx_c = np.mgrid[:2*cut+1, :2*cut+1]
+    fit_mask = np.sqrt((yy_c - cut)**2 + (xx_c - cut)**2) <= fit_r
+
+    ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
+    r = np.sqrt(ii**2 + jj**2)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        K = np.where(r > 0, -1.0 / r**alpha_bfe, 0.0)
+    K[kh, kh] = -K.sum()
+
+    def _simulate(A_bfe_val):
+        Q = np.zeros((nyc, nxc))
+        grads_s = np.zeros((n_grads, nyc, nxc))
+        for g in range(n_grads):
+            tg = rate_c + Adec_c * np.exp(-g / tau)
+            if g == 0:
+                tg = tg - delta_c
+            KQ = fftconvolve(Q, K, mode='same')
+            grads_s[g] = tg * (1.0 - A_bfe_val * KQ)
+            Q += tg
+        return grads_s
+
+    def _objective(log_A):
+        grads_s = _simulate(10**log_A)
+        sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
+        return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
+
+    result = minimize_scalar(_objective, bounds=(-9, -4), method='bounded')
+    A_bfe_fit = 10**result.x
+    if verbose:
+        print(f'  A_bfe = {A_bfe_fit:.4e}  (alpha fixed at {alpha_bfe})')
+
+    return A_bfe_fit, sx, sy
+
+
 def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
-                    bg_mask=None, late_groups=None, verbose=False):
+                    bg_mask=None, late_groups=None, verbose=False,
+                    fit_bfe=False, sci_mask=None,
+                    bfe_early_groups=None, bfe_late_groups=None,
+                    ap_radius=5, cut=20, fit_r=10):
     """
     Joint BFE + reset-decay correction for MIRI ramp data.
 
@@ -307,6 +492,18 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
         Defaults to the last three good gradients.
     verbose : bool
         Print BFE inversion progress.
+    fit_bfe : bool
+        If True, ignore A_bfe and fit it from the brightest source using
+        fit_bfe_params before applying the correction.
+    sci_mask : ndarray (ny, nx) bool, optional
+        True = good science pixels. Passed to fit_bfe_params for SEP source
+        detection. Only used when fit_bfe=True.
+    bfe_early_groups, bfe_late_groups : list of int, optional
+        Gradient indices for the early/late PSF groups used in the BFE fit.
+        Only used when fit_bfe=True.
+    ap_radius, cut, fit_r : float
+        PSF normalisation aperture, cutout half-size, and fit radius in pixels.
+        Only used when fit_bfe=True.
 
     Returns
     -------
@@ -326,6 +523,16 @@ def correct_bfe_rcd(cube, A_bfe=1.035e-6, alpha_bfe=2.783,
 
     if late_groups is None:
         late_groups = list(range(n_grads - 3, n_grads))
+
+    if fit_bfe:
+        if verbose:
+            print('Fitting A_bfe from brightest source...')
+        A_bfe, _sx, _sy = fit_bfe_params(
+            cube, alpha_bfe=alpha_bfe, bg_mask=bg_mask, sci_mask=sci_mask,
+            bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
+            ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
+        if verbose:
+            print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
 
     # Step 1: causal BFE inversion over all gradients
     kh = 20
